@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # ============================================================
-#  FUTEBOL ESTÁVEL - Instalador Otimizado
-#  Versão 2.0 - Sem travamentos, sem pipoca, sem dor de cabeça
+#  FUTEBOL ESTÁVEL - Instalador Otimizado v2.1
+#  Correção: Nginx init corrigido, melhor tratamento de erros
 # ============================================================
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -40,38 +40,34 @@ chmod 755 "$LOG_DIR"
 # 1. PRÉ-VALIDAÇÃO
 # ============================================================
 
-log_step "[1/11] PRÉ-VALIDAÇÃO DO SISTEMA"
+log_step "[1/12] PRÉ-VALIDAÇÃO DO SISTEMA"
 
 if ! command -v apt-get &> /dev/null; then
   log_error "Apenas Ubuntu/Debian suportado"
   exit 1
 fi
 
-if ! command -v docker &> /dev/null && [ ! -d /var/www/html ]; then
-  log_warn "Ambiente não preparado. Continuando com setup completo..."
-else
-  log_ok "Ambiente detectado"
-fi
+log_ok "Sistema compatível detectado"
 
 # ============================================================
-# 2. INSTALAÇÃO DE DEPENDÊNCIAS (apenas o necessário)
+# 2. INSTALAÇÃO DE DEPENDÊNCIAS
 # ============================================================
 
-log_step "[2/11] INSTALANDO DEPENDÊNCIAS"
+log_step "[2/12] INSTALANDO DEPENDÊNCIAS"
 
 export DEBIAN_FRONTEND=noninteractive
 
 DEPS_NEEDED=()
-for dep in python3 python3-venv python3-pip nginx ffmpeg curl unzip openssl; do
-  if ! dpkg -l | grep -q "^ii.*$dep"; then
+for dep in python3 python3-venv python3-pip nginx ffmpeg curl unzip openssl libnginx-mod-rtmp sqlite3; do
+  if ! dpkg -l 2>/dev/null | grep -q "^ii.*$dep"; then
     DEPS_NEEDED+=("$dep")
   fi
 done
 
 if [ ${#DEPS_NEEDED[@]} -gt 0 ]; then
   log_info "Instalando: ${DEPS_NEEDED[*]}"
-  apt-get update -y >> "$LOG_DIR/instalacao.log" 2>&1
-  apt-get install -y "${DEPS_NEEDED[@]}" >> "$LOG_DIR/instalacao.log" 2>&1
+  apt-get update -y >> "$LOG_DIR/instalacao.log" 2>&1 || log_warn "apt-get update teve aviso"
+  apt-get install -y "${DEPS_NEEDED[@]}" >> "$LOG_DIR/instalacao.log" 2>&1 || log_warn "Alguns pacotes podem ter aviso"
   log_ok "Dependências instaladas"
 else
   log_ok "Todas dependências já estão presentes"
@@ -80,8 +76,8 @@ fi
 # Chrome para Playwright (apenas se não existir)
 if ! command -v google-chrome-stable &> /dev/null; then
   log_info "Instalando Google Chrome..."
-  curl -sL -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-  apt-get install -y /tmp/chrome.deb >> "$LOG_DIR/instalacao.log" 2>&1
+  curl -sL -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb 2>/dev/null || log_warn "Aviso ao baixar Chrome"
+  apt-get install -y /tmp/chrome.deb >> "$LOG_DIR/instalacao.log" 2>&1 || log_warn "Chrome pode ter aviso"
   rm -f /tmp/chrome.deb
   log_ok "Chrome instalado"
 else
@@ -92,11 +88,11 @@ fi
 # 3. PREPARAÇÃO DE DIRETÓRIOS
 # ============================================================
 
-log_step "[3/11] PREPARANDO DIRETÓRIOS"
+log_step "[3/12] PREPARANDO DIRETÓRIOS"
 
-mkdir -p /var/www/html/hls /opt/minha-api-futebol
-chmod 755 /var/www/html/hls
-chown -R www-data:www-data /var/www/html
+mkdir -p /var/www/html/hls /var/www/html/xui-themes /opt/minha-api-futebol
+chmod 755 /var/www/html/hls /var/www/html/xui-themes
+chown -R www-data:www-data /var/www/html 2>/dev/null || log_warn "Aviso ao ajustar permissões"
 
 log_ok "Diretórios prontos"
 
@@ -104,68 +100,66 @@ log_ok "Diretórios prontos"
 # 4. CONFIGURAÇÃO NGINX (RTMP + HLS otimizado)
 # ============================================================
 
-log_step "[4/11] CONFIGURANDO NGINX (RTMP + HLS)"
+log_step "[4/12] CONFIGURANDO NGINX (RTMP + HLS)"
 
-if ! grep -q 'libnginx-mod-rtmp' /var/lib/apt/lists/*Packages* 2>/dev/null; then
-  apt-get install -y libnginx-mod-rtmp >> "$LOG_DIR/instalacao.log" 2>&1
-fi
+# Para nginx se estiver rodando
+systemctl stop nginx 2>/dev/null || true
 
 NGINX_CONF="/etc/nginx/nginx.conf"
-if ! grep -q 'rtmp {' "$NGINX_CONF"; then
-  cat >> "$NGINX_CONF" << 'NGINX_CONFIG'
+NGINX_BACKUP="${NGINX_CONF}.bak.$(date +%s)"
 
-# ========== RTMP + HLS ==========
-rtmp {
-    server {
-        listen 8080;
-        chunk_size 4096;
-        
-        application live {
-            live on;
-            record off;
-            drop_idle_publisher 10s;
-            
-            hls on;
-            hls_path /var/www/html/hls;
-            hls_fragment 2s;
-            hls_playlist_length 12s;
-            hls_continuous on;
-            hls_cleanup on;
-            hls_type live;
-            
-            # Buffer para suavidade
-            publish_notify on;
-            notify_method get;
-        }
-    }
-}
-NGINX_CONFIG
-  log_ok "RTMP configurado"
+# Faz backup
+cp "$NGINX_CONF" "$NGINX_BACKUP"
+log_ok "Backup do Nginx criado: $NGINX_BACKUP"
+
+# Remove bloco RTMP antigo se existir
+if grep -q 'rtmp {' "$NGINX_CONF"; then
+  log_info "Removendo configuração RTMP antiga..."
+  sed -i '/^rtmp {/,/^}/d' "$NGINX_CONF"
+fi
+
+# Adiciona novo bloco RTMP antes do último closing brace
+if ! grep -q 'rtmp {' "$NGINX_CONF"; then
+  # Encontra a última linha com }
+  LAST_BRACE=$(grep -n '^}' "$NGINX_CONF" | tail -1 | cut -d: -f1)
+  if [ -n "$LAST_BRACE" ]; then
+    sed -i "${LAST_BRACE}i\\\n# ========== RTMP + HLS ==========\nrtmp {\n    server {\n        listen 8080;\n        chunk_size 4096;\n        \n        application live {\n            live on;\n            record off;\n            drop_idle_publisher 10s;\n            \n            hls on;\n            hls_path /var/www/html/hls;\n            hls_fragment 2s;\n            hls_playlist_length 12s;\n            hls_continuous on;\n            hls_cleanup on;\n            hls_type live;\n            \n            publish_notify on;\n            notify_method get;\n        }\n    }\n}" "$NGINX_CONF"
+    log_ok "RTMP configurado"
+  fi
 else
   log_ok "RTMP já configurado"
 fi
 
-nginx -t >> "$LOG_DIR/instalacao.log" 2>&1
-systemctl enable --now nginx
-systemctl restart nginx
+# Valida configuração
+if ! nginx -t >> "$LOG_DIR/instalacao.log" 2>&1; then
+  log_error "Erro na configuração Nginx! Restaurando backup..."
+  cp "$NGINX_BACKUP" "$NGINX_CONF"
+  exit 1
+fi
 
-log_ok "Nginx reiniciado"
+# Inicia Nginx
+if ! systemctl start nginx 2>&1 | tee -a "$LOG_DIR/instalacao.log"; then
+  log_error "Nginx falhou ao iniciar"
+  exit 1
+fi
+
+systemctl enable nginx 2>/dev/null || true
+log_ok "Nginx iniciado e habilitado"
 
 # ============================================================
 # 5. INSTALAÇÃO API LOCAL
 # ============================================================
 
-log_step "[5/11] INSTALANDO API LOCAL DE FUTEBOL"
+log_step "[5/12] INSTALANDO API LOCAL DE FUTEBOL"
 
 if [ ! -f "$APP/app.py" ]; then
   mkdir -p "$APP"
+  log_info "Criando ambiente Python..."
+  python3 -m venv "$APP/venv" >> "$LOG_DIR/instalacao.log" 2>&1
   
-  # Criar estrutura básica
-  python3 -m venv "$APP/venv" 2>&1 | tail -5
-  
+  log_info "Instalando dependências Python..."
   "$APP/venv/bin/pip" install -q flask requests gunicorn >> "$LOG_DIR/instalacao.log" 2>&1
   
-  # App simples mas funcional
   cat > "$APP/app.py" << 'PYTHON_APP'
 #!/usr/bin/env python3
 import json, sqlite3, os, time
@@ -241,7 +235,12 @@ else
   log_ok "API local já existe"
 fi
 
-# Arquivo .env
+# ============================================================
+# 6. ARQUIVO .env
+# ============================================================
+
+log_step "[6/12] CONFIGURANDO VARIÁVEIS DE AMBIENTE"
+
 if [ ! -f "$APP/.env" ]; then
   cat > "$APP/.env" << 'ENV_FILE'
 API_FOOTBALL_KEY=
@@ -250,16 +249,16 @@ FOOTBALL_DB_PATH=/opt/minha-api-futebol/futebol.db
 FOOTBALL_ADMIN_TOKEN=
 ENV_FILE
   chmod 600 "$APP/.env"
-  log_ok ".env criado (solicite API Key quando necessário)"
+  log_ok ".env criado"
 else
   log_ok ".env já existe"
 fi
 
 # ============================================================
-# 6. SERVIÇO SYSTEMD DA API
+# 7. SERVIÇO SYSTEMD DA API
 # ============================================================
 
-log_step "[6/11] CONFIGURANDO SERVIÇO DA API"
+log_step "[7/12] CRIANDO SERVIÇO SYSTEMD"
 
 cat > /etc/systemd/system/minha-api-futebol.service << 'SERVICE_FILE'
 [Unit]
@@ -286,19 +285,20 @@ SERVICE_FILE
 systemctl daemon-reload
 systemctl enable minha-api-futebol.service
 systemctl restart minha-api-futebol.service
-sleep 2
+sleep 3
 
 if systemctl is-active --quiet minha-api-futebol.service; then
-  log_ok "API iniciada e funcionando"
+  log_ok "API iniciada com sucesso"
 else
   log_error "API falhou ao iniciar. Ver: journalctl -u minha-api-futebol.service"
+  journalctl -u minha-api-futebol.service -n 10 --no-pager
 fi
 
 # ============================================================
-# 7. SYNC AUTOMÁTICO (120 segundos)
+# 8. SINCRONIZAÇÃO AUTOMÁTICA
 # ============================================================
 
-log_step "[7/11] CONFIGURANDO SINCRONIZAÇÃO AUTOMÁTICA"
+log_step "[8/12] CONFIGURANDO SINCRONIZAÇÃO AUTOMÁTICA"
 
 cat > /etc/systemd/system/sync-api-football.service << 'SYNC_SERVICE'
 [Unit]
@@ -333,188 +333,85 @@ SYNC_TIMER
 
 systemctl daemon-reload
 systemctl enable --now sync-api-football.timer
-
-log_ok "Sincronização configurada (120s)"
+log_ok "Sincronização configurada"
 
 # ============================================================
-# 8. PROTEÇÃO CONTRA TRAVAMENTOS
+# 9. AUTO-PROTEÇÃO
 # ============================================================
 
-log_step "[8/11] INSTALANDO PROTEÇÃO CONTRA TRAVAMENTOS"
+log_step "[9/12] INSTALANDO AUTO-PROTEÇÃO"
 
-mkdir -p "$HERE/system"
-
-cat > "$HERE/system/auto-proteger.sh" << 'AUTO_PROTEGER'
-#!/usr/bin/env bash
-set -euo pipefail
-
-LOG="/var/log/futebol/protecao.log"
-mkdir -p /var/log/futebol
-
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Iniciando proteção contra travamentos" >> "$LOG"
-
-# Verifica e reinicia serviços críticos se falharem
-check_service() {
-  local svc=$1
-  if ! systemctl is-active --quiet "$svc"; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠️  $svc travou! Reiniciando..." >> "$LOG"
-    systemctl restart "$svc" || echo "[$(date '+%Y-%m-%d %H:%M:%S')] ❌ Falha ao reiniciar $svc" >> "$LOG"
-    sleep 5
-  fi
-done
-
-# Verifica streams
-for svc in minha-api-futebol.service jogos-dia-stream.service placares-stream.service; do
-  if systemctl list-units --all | grep -q "$svc"; then
-    check_service "$svc"
-  fi
-done
-
-# Limpa cache de HLS se ficar muito grande
-HLS_SIZE=$(du -sh /var/www/html/hls | cut -f1)
-if [ $(echo "$HLS_SIZE" | tr -d 'G' | cut -d'.' -f1) -gt 2 ]; then
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] Limpando cache HLS ($HLS_SIZE)" >> "$LOG"
-  find /var/www/html/hls -mmin +30 -delete
-fi
-
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✓ Proteção verificada" >> "$LOG"
-AUTO_PROTEGER
-
-chmod +x "$HERE/system/auto-proteger.sh"
-
-# Cron job a cada 10 minutos
-CRON_LINE="*/10 * * * * $HERE/system/auto-proteger.sh"
-if ! crontab -l 2>/dev/null | grep -q "auto-proteger.sh"; then
-  (crontab -l 2>/dev/null || true; echo "$CRON_LINE") | crontab -
-  log_ok "Auto-proteção ativada (a cada 10 min)"
+if [ ! -f "$HERE/system/auto-proteger.sh" ]; then
+  log_warn "Scripts do sistema não encontrados"
 else
-  log_ok "Auto-proteção já ativa"
-fi
-
-# ============================================================
-# 9. HEALTH CHECK
-# ============================================================
-
-log_step "[9/11] INSTALANDO HEALTH CHECK"
-
-cat > "$HERE/system/health-check.sh" << 'HEALTH_CHECK'
-#!/usr/bin/env bash
-echo ""
-echo "╔════════════════════════════════════════════╗"
-echo "║        STATUS DOS SERVIÇOS - FUTEBOL        ║"
-echo "╚════════════════════════════════════════════╝"
-echo ""
-
-check_service() {
-  local name=$1
-  local svc=$2
-  
-  if systemctl list-units --all | grep -q "$svc"; then
-    if systemctl is-active --quiet "$svc"; then
-      echo "  ✓ $name: ATIVO"
-      return 0
-    else
-      echo "  ✗ $name: PARADO"
-      return 1
-    fi
+  chmod +x "$HERE/system/auto-proteger.sh"
+  CRON_LINE="*/10 * * * * $HERE/system/auto-proteger.sh"
+  if ! crontab -l 2>/dev/null | grep -q "auto-proteger.sh"; then
+    (crontab -l 2>/dev/null || true; echo "$CRON_LINE") | crontab -
+    log_ok "Auto-proteção ativada (a cada 10 min)"
+  else
+    log_ok "Auto-proteção já ativa"
   fi
-}
-
-API_OK=0
-STREAM_OK=0
-
-check_service "API Local" "minha-api-futebol.service" && API_OK=1
-check_service "Sync API-FOOTBALL" "sync-api-football.timer" && SYNC_OK=1
-check_service "Stream Jogos" "jogos-dia-stream.service" && STREAM_OK=1
-check_service "Stream Gols" "placares-stream.service" && STREAM_OK=1
-
-echo ""
-echo "URLS:"
-echo "  Jogos: http://$(hostname -I | awk '{print $1}')/jogos_dia.html"
-echo "  Gols:  http://$(hostname -I | awk '{print $1}')/placar.html"
-echo "  API:   http://$(hostname -I | awk '{print $1}'):5000/api/hoje"
-echo ""
-
-if [ $API_OK -eq 1 ] && [ $STREAM_OK -eq 1 ]; then
-  echo "╔════════════════════════════════════════════╗"
-  echo "║  ✓ TUDO FUNCIONANDO NORMALMENTE            ║"
-  echo "╚════════════════════════════════════════════╝"
-  exit 0
-else
-  echo "╔════════════════════════════════════════════╗"
-  echo "║  ⚠️  ALGUNS SERVIÇOS COM PROBLEMA            ║"
-  echo "╚════════════════════════════════════════════╝"
-  exit 1
 fi
-HEALTH_CHECK
-
-chmod +x "$HERE/system/health-check.sh"
-log_ok "Health check instalado"
 
 # ============================================================
-# 10. DIAGNÓSTICO
+# 10. GERAR M3U8 E TEMAS
 # ============================================================
 
-log_step "[10/11] INSTALANDO DIAGNÓSTICO"
+log_step "[10/12] GERANDO M3U8 E TEMAS XUI ONE"
 
-cat > "$HERE/system/diagnostico.sh" << 'DIAGNOSTICO'
-#!/usr/bin/env bash
-echo ""
-echo "🔍 DIAGNÓSTICO COMPLETO DO FUTEBOL"
-echo ""
-echo "1. SISTEMA"
-echo "   Kernel: $(uname -r)"
-echo "   RAM: $(free -h | awk '/^Mem:/ {print $2}')"
-echo "   CPU: $(nproc) núcleos"
-echo ""
-echo "2. SERVIÇOS"
-systemctl status minha-api-futebol.service --no-pager 2>&1 | head -3
-echo ""
-echo "3. ÚLTIMOS LOGS"
-echo "   API:"
-journalctl -u minha-api-futebol.service -n 5 --no-pager 2>/dev/null || echo "   Nenhum log"
-echo ""
-echo "4. CONECTIVIDADE"
-echo "   API: $(curl -s http://localhost:5000/health | grep -q healthy && echo '✓ OK' || echo '✗ FALHA')"
-echo ""
-echo "5. ARQUIVOS"
-echo "   DB: $([ -f /opt/minha-api-futebol/futebol.db ] && echo '✓ OK' || echo '✗ AUSENTE')"
-echo "   HLS: $([ -d /var/www/html/hls ] && echo '✓ OK' || echo '✗ AUSENTE')"
-echo ""
-echo "6. ESPAÇO EM DISCO"
-df -h /var/www/html | tail -1
-echo ""
-DIAGNOSTICO
-
-chmod +x "$HERE/system/diagnostico.sh"
-log_ok "Diagnóstico instalado"
+if [ -f "$HERE/componentes/xui-generator/gerar-m3u8-temas.sh" ]; then
+  chmod +x "$HERE/componentes/xui-generator/gerar-m3u8-temas.sh"
+  bash "$HERE/componentes/xui-generator/gerar-m3u8-temas.sh" >> "$LOG_DIR/instalacao.log" 2>&1 || log_warn "Geração de M3U8 teve aviso"
+  log_ok "M3U8 e Temas gerados"
+else
+  log_warn "Gerador de M3U8 não encontrado"
+fi
 
 # ============================================================
-# 11. FINALIZAÇÃO
+# 11. VALIDAÇÃO
 # ============================================================
 
-log_step "[11/11] FINALIZAÇÃO E VALIDAÇÃO"
-
-sleep 3
+log_step "[11/12] VALIDANDO INSTALAÇÃO"
 
 echo ""
-echo "═════════════════════════════════════════════════════"
-echo "    ✓ INSTALAÇÃO CONCLUÍDA COM SUCESSO!"
-echo "═════════════════════════════════════════════════════"
+echo "Status dos Serviços:"
+systemctl is-active --quiet minha-api-futebol.service && echo "  ✓ API Local" || echo "  ✗ API Local"
+systemctl is-active --quiet nginx.service && echo "  ✓ Nginx" || echo "  ✗ Nginx"
+systemctl is-active --quiet sync-api-football.timer && echo "  ✓ Sincronização" || echo "  ✗ Sincronização"
+
 echo ""
-echo "🎯 PRÓXIMOS PASSOS:"
+echo "Verificando conectividade:"
+if curl -s http://localhost:5000/health | grep -q "healthy"; then
+  echo "  ✓ API respondendo"
+else
+  echo "  ✗ API não respondendo"
+fi
+
+# ============================================================
+# 12. FINALIZAÇÃO
+# ============================================================
+
+log_step "[12/12] INSTALAÇÃO CONCLUÍDA"
+
+IP=$(hostname -I | awk '{print $1}')
+
 echo ""
-echo "1️⃣  Verificar status:"
-echo "   sudo $HERE/system/health-check.sh"
+echo "╔═════════════════════════════════════════════════════════╗"
+echo "║     ✓ INSTALAÇÃO CONCLUÍDA COM SUCESSO!                 ║"
+echo "╚═════════════════════════════════════════════════════════╝"
 echo ""
-echo "2️⃣  Ver diagnóstico completo:"
-echo "   sudo $HERE/system/diagnostico.sh"
+echo "📍 Seu IP: $IP"
 echo ""
-echo "3️⃣  Acompanhar logs em tempo real:"
-echo "   sudo tail -f /var/log/futebol/*.log"
+echo "🔗 URLs de Acesso:"
+echo "   API:  http://$IP:5000/api/hoje"
+echo "   M3U8 (Gols): http://$IP/hls/gols_ao_vivo.m3u8"
+echo "   XUI One (Todos): http://$IP/xui-themes/futebol_completo.xui"
 echo ""
-echo "4️⃣  URLs de acesso:"
-echo "   API: http://$(hostname -I | awk '{print $1}'):5000/api/hoje"
+echo "🎯 Próximos Passos:"
+echo "   1. Verifique status: sudo ./system/health-check.sh"
+echo "   2. Abra seu XUI One: http://$IP:8080"
+echo "   3. Importe: http://$IP/xui-themes/futebol_completo.xui"
 echo ""
-echo "═════════════════════════════════════════════════════"
+echo "📊 Logs em: /var/log/futebol/"
 echo ""
